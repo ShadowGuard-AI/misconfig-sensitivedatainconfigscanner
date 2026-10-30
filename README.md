@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # misconfig-SensitiveDataInConfigScanner
 Scans configuration files (e.g., YAML, JSON, .env) for accidentally exposed sensitive data like API keys, passwords, and secrets using regex patterns and entropy analysis. Can integrate with pre-commit hooks to prevent sensitive data from being committed to repositories. - Focused on Check for misconfigurations in configuration files or infrastructure definitions
 
