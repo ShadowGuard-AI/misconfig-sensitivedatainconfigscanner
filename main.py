@@ -6,6 +6,7 @@ import json
 import yaml
 import base64
 import hashlib
+import math
 from typing import List, Tuple
 
 # Configure logging
@@ -42,7 +43,7 @@ def calculate_entropy(data: str) -> float:
 
     for char in frequency:
         probability = frequency[char] / data_length
-        entropy -= probability * (probability).log2()
+        entropy -= probability * math.log2(probability)
 
     return entropy
 
