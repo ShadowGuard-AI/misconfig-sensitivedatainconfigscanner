@@ -2,10 +2,7 @@ import argparse
 import logging
 import os
 import re
-import json
-import yaml
-import base64
-import hashlib
+import sys
 import math
 from typing import List, Tuple
 
@@ -19,7 +16,7 @@ PATTERNS = {
     "secret": r"(?i)(secret|secret[-_]?key|key[-_]?secret)\s*[:=]\s*['\"]?([a-zA-Z0-9!@#$%^&*()_-]+)['\"]?",
     "aws_access_key_id": r"(?i)aws_access_key_id\s*[:=]\s*['\"]?([A-Z0-9]+)['\"]?",
     "aws_secret_access_key": r"(?i)aws_secret_access_key\s*[:=]\s*['\"]?([a-zA-Z0-9/+=]+)['\"]?",
-    "ssh_private_key": r"-----BEGIN RSA PRIVATE KEY-----",
+    "ssh_private_key": r"-----BEGIN (?:(?:RSA|EC|DSA|OPENSSH) )?PRIVATE KEY-----",
     "jwt": r"ey[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*"
 }
 
@@ -61,36 +58,72 @@ def scan_line(line: str, patterns: dict) -> List[Tuple[str, str]]:
     """
     matches = []
     for name, pattern in patterns.items():
-        match = re.search(pattern, line)
-        if match:
-            matches.append((name, match.group(2) if len(match.groups()) >= 2 else match.group(0)))  # Extract actual value
+        for match in re.finditer(pattern, line):
+            groups = match.groups()
+            value = groups[-1] if groups and groups[-1] is not None else match.group(0)
+            matches.append((name, value))
     return matches
 
 
-def scan_file(filepath: str, patterns: dict) -> List[Tuple[str, int, str, str]]:
+# Candidate tokens for the general entropy scan: long runs of the
+# characters secrets are usually built from. Every such token on a
+# line is entropy tested on its own when entropy checking is enabled,
+# whether or not any keyword pattern matched it.
+ENTROPY_TOKEN_PATTERN = r"[A-Za-z0-9_+/=\-]{12,}"
+
+
+def entropy_matches(line: str, threshold: float, already_matched) -> List[Tuple[str, str]]:
+    """
+    Entropy tests the candidate tokens on a line and returns the ones
+    above the threshold that no keyword pattern already reported.
+    """
+    results = []
+    seen = set(already_matched)
+    for match in re.finditer(ENTROPY_TOKEN_PATTERN, line):
+        token = match.group(0)
+        if token in seen:
+            continue
+        seen.add(token)
+        if calculate_entropy(token) > threshold:
+            results.append(("high_entropy", token))
+    return results
+
+
+def scan_file(filepath: str, patterns: dict, entropy_enabled: bool = False, threshold: float = 4.0):
     """
     Scans a file for sensitive data.
 
     Args:
         filepath (str): The path to the file to scan.
         patterns (dict): A dictionary of regex patterns to use.
+        entropy_enabled (bool): Also entropy test candidate tokens on
+            every line and report those above the threshold.
+        threshold (float): The entropy threshold for that scan.
 
     Returns:
-        List[Tuple[str, int, str, str]]: A list of tuples, where each tuple contains the filename, line number,
-                                      pattern name, and the matched value.
+        A pair (findings, lines_scanned). Each finding is a tuple of
+        filename, line number, pattern name, and the matched value.
+        The value is used internally, for example for its entropy
+        figure, and is never printed.
+
+    Raises:
+        OSError, UnicodeDecodeError: If the file cannot be read as
+            text. Callers must treat that as a failed scan, not a
+            clean one.
     """
     findings = []
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            for i, line in enumerate(f):
-                matches = scan_line(line, patterns)
-                for name, value in matches:
-                    findings.append((filepath, i + 1, name, value))
-    except FileNotFoundError:
-        logging.error(f"File not found: {filepath}")
-    except Exception as e:
-        logging.error(f"Error reading file {filepath}: {e}")
-    return findings
+    lines_scanned = 0
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            lines_scanned += 1
+            matches = scan_line(line, patterns)
+            if entropy_enabled:
+                matches = matches + entropy_matches(
+                    line, threshold, [value for _, value in matches]
+                )
+            for name, value in matches:
+                findings.append((filepath, i + 1, name, value))
+    return findings, lines_scanned
 
 
 def validate_input(filepath: str) -> None:
@@ -107,6 +140,8 @@ def validate_input(filepath: str) -> None:
         raise ValueError("Filepath must be a string.")
     if not os.path.exists(filepath):
         raise ValueError(f"File not found: {filepath}")
+    if os.path.isdir(filepath):
+        raise ValueError(f"Target is a directory, not a file: {filepath}. Nothing was scanned.")
 
 
 def setup_argparse() -> argparse.ArgumentParser:
@@ -137,30 +172,45 @@ def main() -> None:
 
     try:
         validate_input(args.filepath)
-        findings = scan_file(args.filepath, PATTERNS)
-
-        if findings:
-            print("Sensitive data found:")
-            for filepath, line_number, pattern_name, value in findings:
-                print(f"  File: {filepath}")
-                print(f"  Line: {line_number}")
-                print(f"  Pattern: {pattern_name}")
-                print(f"  Value: {value}")
-
-                if args.entropy:
-                    entropy = calculate_entropy(value)
-                    print(f"  Entropy: {entropy:.2f}")
-                    if entropy > args.threshold:
-                        print("  [WARNING] High entropy detected!")
-                print("-" * 20)
-
-        else:
-            print("No sensitive data found.")
-
     except ValueError as e:
         logging.error(f"Input error: {e}")
+        sys.exit(1)
+
+    try:
+        findings, lines_scanned = scan_file(
+            args.filepath, PATTERNS,
+            entropy_enabled=args.entropy, threshold=args.threshold,
+        )
+    except (OSError, UnicodeDecodeError) as e:
+        logging.error(f"Could not scan '{args.filepath}': {e}. Nothing was scanned.")
+        sys.exit(1)
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
+        sys.exit(1)
+
+    if lines_scanned == 0:
+        print("Nothing was scanned: the file contains no lines.")
+        sys.exit(1)
+
+    if findings:
+        # Found values are never printed, in any branch. Findings are
+        # reported by file, line, and pattern name only.
+        print("Sensitive data found:")
+        for filepath, line_number, pattern_name, value in findings:
+            print(f"  File: {filepath}")
+            print(f"  Line: {line_number}")
+            print(f"  Pattern: {pattern_name}")
+
+            if args.entropy:
+                entropy = calculate_entropy(value)
+                print(f"  Entropy: {entropy:.2f}")
+                if entropy > args.threshold:
+                    print("  [WARNING] High entropy detected!")
+            print("-" * 20)
+        sys.exit(1)
+
+    print("No sensitive data found.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
@@ -170,16 +220,16 @@ if __name__ == "__main__":
 # Usage Examples:
 
 # 1. Basic usage:
-#    python misconfig-SensitiveDataInConfigScanner.py config.yaml
+#    python3 main.py config.yaml
 
 # 2. Verbose mode:
-#    python misconfig-SensitiveDataInConfigScanner.py config.yaml -v
+#    python3 main.py config.yaml -v
 
 # 3. With entropy check:
-#    python misconfig-SensitiveDataInConfigScanner.py config.yaml -e
+#    python3 main.py config.yaml -e
 
 # 4. With custom entropy threshold:
-#    python misconfig-SensitiveDataInConfigScanner.py config.yaml -e -t 4.5
+#    python3 main.py config.yaml -e -t 4.5
 
 # To integrate with pre-commit hooks:
 
@@ -192,7 +242,7 @@ if __name__ == "__main__":
 #     hooks:
 #       - id: sensitive-data-scan
 #         name: Scan for sensitive data
-#         entry: python misconfig-SensitiveDataInConfigScanner.py
+#         entry: python3 main.py
 #         language: system
 #         files: \.(yaml|json|env)$  # Apply to YAML, JSON, and .env files
 #         pass_filenames: true
