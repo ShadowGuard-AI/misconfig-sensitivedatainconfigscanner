@@ -60,6 +60,11 @@ def scan_line(line: str, patterns: dict) -> List[Tuple[str, str]]:
     for name, pattern in patterns.items():
         for match in re.finditer(pattern, line):
             groups = match.groups()
+            # The value I keep is the last capture group, which for the
+            # keyword patterns is the value and for the private key
+            # pattern, which has no value group, is the header text
+            # itself. The entropy printed in main for a key finding is
+            # therefore sometimes the entropy of a header line.
             value = groups[-1] if groups and groups[-1] is not None else match.group(0)
             matches.append((name, value))
     return matches
@@ -81,6 +86,12 @@ def entropy_matches(line: str, threshold: float, already_matched) -> List[Tuple[
     seen = set(already_matched)
     for match in re.finditer(ENTROPY_TOKEN_PATTERN, line):
         token = match.group(0)
+        # Deduplication compares whole tokens against the values the
+        # keyword patterns already returned, but a keyword value is
+        # often a piece of a longer token, quotes trimmed, characters
+        # outside its set cut away. The full token then fails this
+        # test and can be reported a second time as high entropy on
+        # the same line.
         if token in seen:
             continue
         seen.add(token)
@@ -114,8 +125,18 @@ def scan_file(filepath: str, patterns: dict, entropy_enabled: bool = False, thre
     findings = []
     lines_scanned = 0
     with open(filepath, 'r', encoding='utf-8') as f:
+        # Everything I do is per line. A key on one line and its value
+        # on the next, a common YAML shape, never meets any pattern,
+        # because each pattern needs the name, the separator, and the
+        # value on the same line. Multi line values are invisible to
+        # me in the other direction too.
         for i, line in enumerate(f):
             lines_scanned += 1
+            # The password and secret patterns stop their value at the
+            # first character outside their set, so a value containing a
+            # dot or a comma is captured only up to that point. What I
+            # report finding, and what main measures the entropy of, can
+            # be a fragment of the value actually in the file.
             matches = scan_line(line, patterns)
             if entropy_enabled:
                 matches = matches + entropy_matches(
@@ -202,6 +223,12 @@ def main() -> None:
             print(f"  Pattern: {pattern_name}")
 
             if args.entropy:
+                # This runs for every finding whenever the entropy flag is
+                # set, including plain keyword findings, and the warning
+                # below compares them against a threshold meant for the
+                # token scan. Without the flag the same threshold argument
+                # still exists but changes nothing at all, because the token
+                # scan is the only other place it is read.
                 entropy = calculate_entropy(value)
                 print(f"  Entropy: {entropy:.2f}")
                 if entropy > args.threshold:
